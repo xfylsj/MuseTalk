@@ -82,80 +82,85 @@ def get_bbox_range(img_list,upperbondrange =0):
     
 
 def get_landmark_and_bbox(img_list,upperbondrange =0):
-    """
-    获取图像列表中每张图片的人脸关键点和边界框坐标
-    
-    该函数的主要功能：
-    1. 读取图像列表中的所有图片
-    2. 使用MMPose模型检测人体关键点，提取面部关键点(23-91)
-    3. 使用人脸检测模型获取人脸边界框
-    4. 根据关键点调整边界框位置，特别是根据upperbondrange参数调整上边界
-    5. 计算面部区域的精确边界框坐标
-    6. 处理检测失败的情况，使用占位符或原始边界框
-    7. 返回调整后的边界框坐标列表和关键点信息
-    
-    参数:
-        img_list: 图像文件路径列表
-        upperbondrange: 上边界调整偏移量，用于手动调整面部区域的上边界位置
-    
-    返回:
-        coords_list: 调整后的边界框坐标列表
-        landmarks: 人脸关键点列表
-    """
+    # 读取图片列表中的所有图片
     frames = read_imgs(img_list)
+    # 设置批处理大小为1
     batch_size_fa = 1
+    # 将图片按批次大小分组
     batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
+    # 初始化坐标列表
     coords_list = []
+    # 初始化关键点列表
     landmarks = []
+    # 打印bbox_shift参数信息
     if upperbondrange != 0:
         print('get key_landmark and face bounding boxes with the bbox_shift:',upperbondrange)
     else:
         print('get key_landmark and face bounding boxes with the default value')
+    # 初始化上下范围列表
     average_range_minus = []
     average_range_plus = []
+    # 遍历每个批次的图片
     for fb in tqdm(batches):
+        # 使用模型进行关键点检测
         results = inference_topdown(model, np.asarray(fb)[0])
+        # 合并检测结果
         results = merge_data_samples(results)
+        # 获取关键点坐标
         keypoints = results.pred_instances.keypoints
+        # 提取面部关键点(23-91)
         face_land_mark= keypoints[0][23:91]
+        # 将关键点坐标转换为整数类型
         face_land_mark = face_land_mark.astype(np.int32)
         
-        # get bounding boxes by face detetion
+        # 使用人脸检测获取边界框
         bbox = fa.get_detections_for_batch(np.asarray(fb))
         
-        # adjust the bounding box refer to landmark
-        # Add the bounding box to a tuple and append it to the coordinates list
+        # 根据关键点调整边界框
+        # 将边界框添加到坐标列表中
         for j, f in enumerate(bbox):
+            # 如果未检测到人脸，添加占位符并继续
             if f is None: # no face in the image
                 coords_list += [coord_placeholder]
                 continue
             
-            half_face_coord =  face_land_mark[29]#np.mean([face_land_mark[28], face_land_mark[29]], axis=0)
+            # 获取面部中点坐标(使用第29个关键点)
+            half_face_coord =  face_land_mark[29]
+            # 计算向下的调整范围
             range_minus = (face_land_mark[30]- face_land_mark[29])[1]
+            # 计算向上的调整范围
             range_plus = (face_land_mark[29]- face_land_mark[28])[1]
+            # 将调整范围添加到列表中
             average_range_minus.append(range_minus)
             average_range_plus.append(range_plus)
+            # 如果指定了upperbondrange，则调整y坐标
             if upperbondrange != 0:
                 half_face_coord[1] = upperbondrange+half_face_coord[1] #手动调整  + 向下（偏29）  - 向上（偏28）
+            # 计算面部高度
             half_face_dist = np.max(face_land_mark[:,1]) - half_face_coord[1]
-            min_upper_bond = 0
-            upper_bond = max(min_upper_bond, half_face_coord[1] - half_face_dist)
+            # 计算上边界
+            upper_bond = half_face_coord[1]-half_face_dist
             
+            # 根据关键点计算边界框坐标
             f_landmark = (np.min(face_land_mark[:, 0]),int(upper_bond),np.max(face_land_mark[:, 0]),np.max(face_land_mark[:,1]))
             x1, y1, x2, y2 = f_landmark
             
+            # 检查边界框是否有效
             if y2-y1<=0 or x2-x1<=0 or x1<0: # if the landmark bbox is not suitable, reuse the bbox
+                # 如果无效则使用原始边界框
                 coords_list += [f]
                 w,h = f[2]-f[0], f[3]-f[1]
                 print("error bbox:",f)
             else:
+                # 如果有效则使用关键点边界框
                 coords_list += [f_landmark]
     
+    # 打印bbox_shift参数调整信息
     print("********************************************bbox_shift parameter adjustment**********************************************************")
     print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
     print("*************************************************************************************************************************************")
+    # 返回坐标列表和图片列表
     return coords_list,frames
-    
 
 if __name__ == "__main__":
     img_list = ["./results/lyria/00000.png","./results/lyria/00001.png","./results/lyria/00002.png","./results/lyria/00003.png"]
