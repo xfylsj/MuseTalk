@@ -1,0 +1,9 @@
+avator_1:
+ preparation: True # your can set it to False if you want to use the existing avator, it will save time
+ bbox_shift: 5
+ pic_path: "data/pic/dd.png"
+ audio_clips:
+     audio_0: "data/audio/dd.wav"
+ 
+  
+
