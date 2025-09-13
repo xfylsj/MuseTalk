@@ -179,12 +179,12 @@ if __name__ == "__main__":
     audio_processor = AudioProcessor("./models/whisper")
     wav_path = "./data/audio/dd.wav"
     
-    # 测试传统音频文件处理
+    # --- 测试传统音频文件处理
     audio_feature, librosa_feature_length = audio_processor.get_audio_feature(wav_path)
     print("Audio Feature shape:", audio_feature[0].shape if audio_feature else "None")
     print("librosa_feature_length:", librosa_feature_length)
     
-    # 测试音频流处理
+    # --- 测试音频流处理
     print("\n--- Testing Audio Stream Processing ---")
     try:
         # 方法1: 从文件创建音频流

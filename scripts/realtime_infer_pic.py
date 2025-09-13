@@ -91,7 +91,8 @@ class Avatar:
         """初始化虚拟人物，包括创建必要的目录和加载或准备数据"""
         if self.preparation:  # 如果需要预处理
             if os.path.exists(self.avatar_path):  # 检查虚拟人物目录是否存在
-                response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
+                # response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
+                response = "y"  # TODO: for testing
                 if response.lower() == "y":  # 如果用户选择重新创建
                     shutil.rmtree(self.avatar_path)  # 删除现有目录
                     print("*********************************")
@@ -275,7 +276,7 @@ class Avatar:
             self.idx = self.idx + 1
 
     @torch.no_grad()
-    def inference(self, audio_path, out_vid_name, fps, skip_save_images):
+    def inference_origin(self, audio_path, out_vid_name, fps, skip_save_images):
         """执行推理过程，生成视频
         Args:
             audio_path: 音频文件路径
@@ -295,6 +296,100 @@ class Avatar:
             weight_dtype,
             whisper,
             librosa_length,
+            fps=fps,
+            audio_padding_length_left=args.audio_padding_length_left,
+            audio_padding_length_right=args.audio_padding_length_right,
+        )
+        print(f"processing audio:{audio_path} costs {(time.time() - start_time) * 1000}ms")
+        ############################################## inference batch by batch ##############################################
+        video_num = len(whisper_chunks)  # 获取视频帧数
+        res_frame_queue = queue.Queue()  # 创建结果帧队列
+        self.idx = 0
+        # 创建并启动处理线程
+        process_thread = threading.Thread(target=self.process_frames, args=(res_frame_queue, video_num, skip_save_images))
+        process_thread.start()
+
+        gen = datagen(whisper_chunks,  # 生成数据批次
+                     self.input_latent_list_cycle,
+                     self.batch_size)
+        start_time = time.time()
+        res_frame_list = []
+
+        # 批量处理数据。*** 主要的视频帧就在这里完成 ***
+        for i, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=int(np.ceil(float(video_num) / self.batch_size)))):
+            """
+            pe是位置编码器（Positional Encoder）的缩写
+            - 这个编码器用于为音频特征添加位置信息
+            - 位置编码可以帮助模型理解音频特征在时间序列中的位置关系
+            - 这对于生成与音频同步的嘴型动作非常重要
+            """
+            audio_feature_batch = pe(whisper_batch.to(device))  # 处理音频特征
+            latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)  # 转换潜在向量
+
+            pred_latents = unet.model(latent_batch,  # 使用UNet模型生成预测
+                                    timesteps,
+                                    encoder_hidden_states=audio_feature_batch).sample
+            pred_latents = pred_latents.to(device=device, dtype=vae.vae.dtype)  # 转换预测结果
+            recon = vae.decode_latents(pred_latents)  # 解码潜在向量
+            for res_frame in recon:
+                res_frame_queue.put(res_frame)  # 将结果放入队列
+        # 等待处理线程完成
+        process_thread.join()
+
+        if args.skip_save_images is True:  # 如果跳过保存图片
+            print('Total process time of {} frames without saving images = {}s'.format(
+                video_num,
+                time.time() - start_time))
+        else:  # 如果保存图片
+            print('Total process time of {} frames including saving images = {}s'.format(
+                video_num,
+                time.time() - start_time))
+
+        if out_vid_name is not None and args.skip_save_images is False:  # 如果需要生成视频
+            # 将图片序列转换为视频
+            cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {self.avatar_path}/tmp/%08d.png -vcodec libx264 -vf format=yuv420p -crf 18 {self.avatar_path}/temp.mp4"
+            print(cmd_img2video)
+            os.system(cmd_img2video)
+
+            output_vid = os.path.join(self.video_out_path, out_vid_name + ".mp4")  # 设置输出视频路径
+            # 将音频和视频合并
+            cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {self.avatar_path}/temp.mp4 {output_vid}"
+            print(cmd_combine_audio)
+            os.system(cmd_combine_audio)
+
+            os.remove(f"{self.avatar_path}/temp.mp4")  # 删除临时视频文件
+            shutil.rmtree(f"{self.avatar_path}/tmp")  # 删除临时目录
+            print(f"result is save to {output_vid}")
+        print("\n")
+
+    @torch.no_grad()
+    def inference_stream(self, audio_path, out_vid_name, fps, skip_save_images):
+        """执行推理过程，生成视频
+        Args:
+            audio_path: 音频文件路径
+            out_vid_name: 输出视频名称
+            fps: 帧率
+            skip_save_images: 是否跳过保存图片
+        """
+        os.makedirs(self.avatar_path + '/tmp', exist_ok=True)  # 创建临时目录
+        print("start inference")
+        ############################################## extract audio feature ##############################################
+        start_time = time.time()
+        # 提取音频特征
+        # 从文件创建音频流
+        audio_stream_chunks = []
+        for chunk in audio_processor.create_audio_stream_from_file(audio_path, chunk_size=16000):  # 1秒的块
+            audio_stream_chunks.append(chunk)
+        # 将流数据合并为完整音频数据
+        audio_stream_data = np.concatenate(audio_stream_chunks)
+        stream_features, stream_length = audio_processor.get_audio_stream_feature(audio_stream_data, weight_dtype=weight_dtype) # 获取音频特征
+
+        whisper_chunks = audio_processor.get_whisper_chunk(  # 获取Whisper模型的分块
+            stream_features,
+            device,
+            weight_dtype,
+            whisper,
+            stream_length,
             fps=fps,
             audio_padding_length_left=args.audio_padding_length_left,
             audio_padding_length_right=args.audio_padding_length_right,
@@ -461,7 +556,7 @@ if __name__ == "__main__":
         audio_clips = inference_config[avatar_id]["audio_clips"]  # 获取音频片段
         for audio_num, audio_path in audio_clips.items():  # 处理每个音频片段
             print("Inferring using:", audio_path)
-            avatar.inference(audio_path,  # 执行推理
+            avatar.inference_stream(audio_path,  # 执行推理
                            audio_num,
                            args.fps,
                            args.skip_save_images)
