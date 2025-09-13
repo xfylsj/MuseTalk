@@ -60,6 +60,7 @@ class AudioProcessor:
         
         # 将音频流分割成30秒的片段进行处理
         segment_length = 30 * sampling_rate
+        # segment_length = 3 * sampling_rate  # TODO: 1秒效果很差，3秒的前几秒可以，后面就不行了
         segments = []
         
         # 按30秒片段分割音频流
@@ -127,43 +128,73 @@ class AudioProcessor:
         audio_padding_length_left=2,
         audio_padding_length_right=2,
     ):
+        """
+        将音频特征转换为Whisper模型所需的格式，并生成每一帧对应的音频特征序列
+
+        Args:
+            whisper_input_features: 从音频提取的Whisper特征列表
+            device: 计算设备(CPU/GPU)
+            weight_dtype: 权重数据类型
+            whisper: Whisper模型实例
+            librosa_length: 音频长度(采样点数)
+            fps: 视频帧率,默认25fps
+            audio_padding_length_left: 音频特征左侧填充长度,默认2
+            audio_padding_length_right: 音频特征右侧填充长度,默认2
+
+        Returns:
+            audio_prompts: 每一帧对应的音频特征序列,形状为[num_frames, seq_len, hidden_dim]
+        """
+        # 计算每帧的音频特征长度
         audio_feature_length_per_frame = 2 * (audio_padding_length_left + audio_padding_length_right + 1)
         whisper_feature = []
         # Process multiple 30s mel input features
+        # 处理多个30秒的梅尔频谱输入特征
         for input_feature in whisper_input_features:
+            # 将特征移动到指定设备并转换数据类型
             input_feature = input_feature.to(device).to(weight_dtype)
+            # 使用Whisper编码器提取音频特征
             audio_feats = whisper.encoder(input_feature, output_hidden_states=True).hidden_states
+            # 将隐藏状态堆叠在一起
             audio_feats = torch.stack(audio_feats, dim=2)
             whisper_feature.append(audio_feats)
 
+        # 连接所有特征
         whisper_feature = torch.cat(whisper_feature, dim=1)
         # Trim the last segment to remove padding
-        sr = 16000
-        audio_fps = 50
-        fps = int(fps)
-        whisper_idx_multiplier = audio_fps / fps
-        num_frames = math.floor((librosa_length / sr) * fps)
-        actual_length = math.floor((librosa_length / sr) * audio_fps)
-        whisper_feature = whisper_feature[:,:actual_length,...]
+        # 裁剪最后一个片段以移除填充
+        sr = 16000  # 音频采样率
+        audio_fps = 50  # 音频帧率
+        fps = int(fps)  # 视频帧率
+        whisper_idx_multiplier = audio_fps / fps  # 音频到视频帧率的比率
+        num_frames = math.floor((librosa_length / sr) * fps)  # 总视频帧数
+        actual_length = math.floor((librosa_length / sr) * audio_fps)  # 实际音频长度
+        whisper_feature = whisper_feature[:,:actual_length,...]  # 将特征裁剪到实际长度
 
-        # Calculate padding amount
+        # 计算填充量并添加填充
         padding_nums = math.ceil(whisper_idx_multiplier)
         # Add padding at start and end
+        # 在开始和结束处添加填充
         whisper_feature = torch.cat([
-            torch.zeros_like(whisper_feature[:, :padding_nums * audio_padding_length_left]),
-            whisper_feature,
+            torch.zeros_like(whisper_feature[:, :padding_nums * audio_padding_length_left]),  # 左侧填充
+            whisper_feature,  # 原始特征
             # Add extra padding to prevent out of bounds
-            torch.zeros_like(whisper_feature[:, :padding_nums * 3 * audio_padding_length_right])
+            # 添加额外填充以防止越界
+            torch.zeros_like(whisper_feature[:, :padding_nums * 3 * audio_padding_length_right])  # 右侧填充
         ], 1)
 
+        # 为每一帧生成音频特征
         audio_prompts = []
         for frame_index in range(num_frames):
             try:
+                # 计算当前帧的音频索引
                 audio_index = math.floor(frame_index * whisper_idx_multiplier)
+                # 提取当前帧的音频片段
                 audio_clip = whisper_feature[:, audio_index: audio_index + audio_feature_length_per_frame]
+                # 确保音频片段长度正确
                 assert audio_clip.shape[1] == audio_feature_length_per_frame
                 audio_prompts.append(audio_clip)
             except Exception as e:
+                # 错误处理：打印详细的调试信息
                 print(f"Error occurred: {e}")
                 print(f"whisper_feature.shape: {whisper_feature.shape}")
                 print(f"audio_clip.shape: {audio_clip.shape}")
@@ -171,8 +202,9 @@ class AudioProcessor:
                 print(f"frame_index: {frame_index}, audio_index: {audio_index}-{audio_index + audio_feature_length_per_frame}")
                 exit()
 
-        audio_prompts = torch.cat(audio_prompts, dim=0)  # T, 10, 5, 384
-        audio_prompts = rearrange(audio_prompts, 'b c h w -> b (c h) w')
+        # 连接所有音频提示并重新排列维度
+        audio_prompts = torch.cat(audio_prompts, dim=0)  # 形状：[T, 10, 5, 384]
+        audio_prompts = rearrange(audio_prompts, 'b c h w -> b (c h) w')  # 重新排列维度
         return audio_prompts
 
 if __name__ == "__main__":

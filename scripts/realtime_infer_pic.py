@@ -276,7 +276,7 @@ class Avatar:
             self.idx = self.idx + 1
 
     @torch.no_grad()
-    def inference_origin(self, audio_path, out_vid_name, fps, skip_save_images):
+    def inference(self, audio_path, out_vid_name, fps, skip_save_images):
         """执行推理过程，生成视频
         Args:
             audio_path: 音频文件路径
