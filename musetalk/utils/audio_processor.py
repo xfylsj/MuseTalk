@@ -18,7 +18,8 @@ class AudioProcessor:
         librosa_output, sampling_rate = librosa.load(wav_path, sr=16000)
         assert sampling_rate == 16000
         # Split audio into 30s segments
-        segment_length = 30 * sampling_rate
+        # segment_length = 30 * sampling_rate
+        segment_length = 3 * sampling_rate
         segments = [librosa_output[i:i + segment_length] for i in range(0, len(librosa_output), segment_length)]
 
         features = []
@@ -71,6 +72,8 @@ class AudioProcessor:
                 segment = np.pad(segment, (0, segment_length - len(segment)), 'constant')
             segments.append(segment)
 
+        print(f"---segments length: {len(segments)}")
+
         # 提取每个片段的特征
         features = []
         for segment in segments:
@@ -87,6 +90,19 @@ class AudioProcessor:
                 return_tensors="pt",
                 sampling_rate=sampling_rate
             ).input_features
+
+            print(f"--- audio_feature.shape: {audio_feature.shape}")
+
+            """
+                audio_feature.shape = torch.Size([1, 80, 3000])
+                - 形状含义: [batch, n_mels, n_frames] = [1, 80, 3000]
+                -- 1: 单个样本的 batch
+                -- 80: 梅尔滤波器组数量（Whisper 固定 80 维）
+                -- 3000: 时间帧数。Whisper 提取器以 16 kHz 采样、hop_length=160（每帧 10 ms，100 fps）生成 30 s 的对数梅尔谱，所以 30 s × 100 fps = 3000 帧
+
+                - 短音频也会被右侧零填充到 3000 帧；长音频会被分段处理，每段各自得到一个 [1, 80, 3000]。
+                - 进入 whisper.encoder 后，时间维会因下采样从 3000 变为 1500（约 50 fps），随后你的代码把各层隐藏态堆叠，变成类似 [1, 1500, num_layers, hidden_dim]，再按时间维拼接多个片段。
+            """
 
             # 如果指定了权重数据类型,则进行转换
             if weight_dtype is not None:
@@ -152,11 +168,30 @@ class AudioProcessor:
         for input_feature in whisper_input_features:
             # 将特征移动到指定设备并转换数据类型
             input_feature = input_feature.to(device).to(weight_dtype)
-            # 使用Whisper编码器提取音频特征
+            # 使用Whisper编码器提取音频特征（在这里会长度会填充到30秒）
             audio_feats = whisper.encoder(input_feature, output_hidden_states=True).hidden_states
             # 将隐藏状态堆叠在一起
             audio_feats = torch.stack(audio_feats, dim=2)
+
+            # 计算当前段的有效长度（3秒对应的帧数）
+            # Whisper encoder下采样后：3秒 * 50fps = 150帧
+            segment_duration_frames = 50 * 3  # 3秒对应的帧数 TODO: 时间长度可能会改
+            # 裁剪到实际3秒长度，避免30秒填充的影响
+            audio_feats = audio_feats[:, :segment_duration_frames, :, :]
+
             whisper_feature.append(audio_feats)
+            print(f"---audio_feats.shape: {audio_feats.shape}")
+
+            """
+            - batch=1: 单段/单样本处理。
+            - 时间步=1500: Whisper 编码器把梅尔谱 [1, 80, 3000] 经过下采样（卷积 stride=2）变成约 50 fps，所以 30s × 50 = 1500。
+            - 层数=5: 取了 5 个 Transformer 编码层的隐藏状态并在“层”维度堆叠，比如从若干指定的层索引收集到的特征；这个 5 就是所选层的数量。
+            - 隐藏维度=384: Whisper 模型的通道维（比如 tiny 模型的 d_model=384）。不同规模模型该维度会不同。
+            
+            因此 audio_feats 的语义是：
+            - 形状 [batch, time, num_selected_layers, hidden_dim] = [1, 1500, 5, 384]
+            - 后续会在时间维（dim=1）把多个片段首尾相接，并按滑动窗口从时间轴裁剪出每个视频帧需要的音频提示特征。
+            """
 
         # 连接所有特征
         whisper_feature = torch.cat(whisper_feature, dim=1)
@@ -164,11 +199,14 @@ class AudioProcessor:
         # 裁剪最后一个片段以移除填充
         sr = 16000  # 音频采样率
         audio_fps = 50  # 音频帧率
-        fps = int(fps)  # 视频帧率
-        whisper_idx_multiplier = audio_fps / fps  # 音频到视频帧率的比率
+        fps = int(fps)  # 25, 视频帧率
+        whisper_idx_multiplier = audio_fps / fps  # 2, 音频到视频帧率的比率
         num_frames = math.floor((librosa_length / sr) * fps)  # 总视频帧数
         actual_length = math.floor((librosa_length / sr) * audio_fps)  # 实际音频长度
         whisper_feature = whisper_feature[:,:actual_length,...]  # 将特征裁剪到实际长度
+
+        
+
 
         # 计算填充量并添加填充
         padding_nums = math.ceil(whisper_idx_multiplier)
@@ -205,6 +243,17 @@ class AudioProcessor:
         # 连接所有音频提示并重新排列维度
         audio_prompts = torch.cat(audio_prompts, dim=0)  # 形状：[T, 10, 5, 384]
         audio_prompts = rearrange(audio_prompts, 'b c h w -> b (c h) w')  # 重新排列维度
+
+        print(">>>>>>>>>>>>>>>>>>>>")
+        print(f"whisper_feature.shape: {whisper_feature.shape}")
+        print(f"num_frames: {num_frames}, fps: {fps}, whisper_idx_multiplier: {whisper_idx_multiplier}")
+        print(f"actual_length: {actual_length}")
+        print(f"audio_padding_length_left: {audio_padding_length_left}, audio_padding_length_right: {audio_padding_length_right}")
+        print(f"padding_nums: {padding_nums}")
+        print(f"audio_feature_length_per_frame: {audio_feature_length_per_frame}")
+        print(f"audio_prompts.shape: {audio_prompts.shape}")
+        print(">>>>>>>>>>>>>>>>>>>>")
+
         return audio_prompts
 
 if __name__ == "__main__":
@@ -215,6 +264,7 @@ if __name__ == "__main__":
     audio_feature, librosa_feature_length = audio_processor.get_audio_feature(wav_path)
     print("Audio Feature shape:", audio_feature[0].shape if audio_feature else "None")
     print("librosa_feature_length:", librosa_feature_length)
+    
     
     # --- 测试音频流处理
     print("\n--- Testing Audio Stream Processing ---")
