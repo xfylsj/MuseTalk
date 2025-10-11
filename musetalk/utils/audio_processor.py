@@ -19,7 +19,7 @@ class AudioProcessor:
         assert sampling_rate == 16000
         # Split audio into 30s segments
         # segment_length = 30 * sampling_rate
-        segment_length = 3 * sampling_rate
+        segment_length = 1 * sampling_rate
         segments = [librosa_output[i:i + segment_length] for i in range(0, len(librosa_output), segment_length)]
 
         features = []
@@ -60,8 +60,7 @@ class AudioProcessor:
         sampling_rate = 16000
         
         # 将音频流分割成30秒的片段进行处理
-        segment_length = 30 * sampling_rate
-        # segment_length = 3 * sampling_rate  # TODO: 1秒效果很差，3秒的前几秒可以，后面就不行了
+        segment_length = 1 * sampling_rate
         segments = []
         
         # 按30秒片段分割音频流
@@ -175,7 +174,7 @@ class AudioProcessor:
 
             # 计算当前段的有效长度（3秒对应的帧数）
             # Whisper encoder下采样后：3秒 * 50fps = 150帧
-            segment_duration_frames = 50 * 3  # 3秒对应的帧数 TODO: 时间长度可能会改
+            segment_duration_frames = 50 * 1  # 3秒对应的帧数 TODO: 时间长度可能会改
             # 裁剪到实际3秒长度，避免30秒填充的影响
             audio_feats = audio_feats[:, :segment_duration_frames, :, :]
 
