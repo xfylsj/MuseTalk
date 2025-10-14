@@ -33,177 +33,177 @@ sync_start_time = None  # 同步开始时间
 
 # HTML 客户端页面
 HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>视频帧音频帧实时播放</title>
-</head>
-<body>
-    <h2>MP4视频分帧实时播放 Demo</h2>
-    <input type="file" id="fileInput" accept="video/mp4">
-    <button id="uploadBtn">上传视频</button>
-    <button id="playBtn" disabled>播放</button>
-    <br><br>
-    <video id="videoPlayer" width="400" controls></video>
-    <audio id="audioPlayer" controls style="display: none;"></audio>
-    <p id="status"></p>
-    <button onclick="checkDebug()">检查状态</button>
-    <button onclick="createTestFrames()">创建测试帧</button>
-    <div id="debugInfo" style="display:none; background:#f0f0f0; padding:10px; margin:10px 0;"></div>
-    <script>
-        let uploaded = false;
-        let playBtn = document.getElementById("playBtn");
-        let uploadBtn = document.getElementById("uploadBtn");
-        let statusText = document.getElementById("status");
-        let videoPlayer = document.getElementById("videoPlayer");
-        let audioPlayer = document.getElementById("audioPlayer");
-        let fileInput = document.getElementById("fileInput");
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>视频帧音频帧实时播放</title>
+    </head>
+    <body>
+        <h2>MP4视频分帧实时播放 Demo</h2>
+        <input type="file" id="fileInput" accept="video/mp4">
+        <button id="uploadBtn">上传视频</button>
+        <button id="playBtn" disabled>播放</button>
+        <br><br>
+        <video id="videoPlayer" width="400" controls></video>
+        <audio id="audioPlayer" controls style="display: none;"></audio>
+        <p id="status"></p>
+        <button onclick="checkDebug()">检查状态</button>
+        <button onclick="createTestFrames()">创建测试帧</button>
+        <div id="debugInfo" style="display:none; background:#f0f0f0; padding:10px; margin:10px 0;"></div>
+        <script>
+            let uploaded = false;
+            let playBtn = document.getElementById("playBtn");
+            let uploadBtn = document.getElementById("uploadBtn");
+            let statusText = document.getElementById("status");
+            let videoPlayer = document.getElementById("videoPlayer");
+            let audioPlayer = document.getElementById("audioPlayer");
+            let fileInput = document.getElementById("fileInput");
 
-        uploadBtn.onclick = function() {
-            let file = fileInput.files[0];
-            if (!file) {
-                alert("请选择一个mp4视频文件");
-                return;
-            }
-            let formData = new FormData();
-            formData.append("file", file);
-
-            statusText.textContent = "上传中...";
-            playBtn.disabled = true;
-            fetch("/upload", {
-                method: "POST",
-                body: formData
-            }).then(resp => resp.json())
-            .then(data => {
-                if (data.status === "ok") {
-                    uploaded = true;
-                    statusText.textContent = "上传并切分完成！";
-                    playBtn.disabled = false;
-                } else {
-                    statusText.textContent = "上传失败";
+            uploadBtn.onclick = function() {
+                let file = fileInput.files[0];
+                if (!file) {
+                    alert("请选择一个mp4视频文件");
+                    return;
                 }
-            }).catch(e=>{
-                statusText.textContent = "服务器出错: " + e;
-            });
-        };
+                let formData = new FormData();
+                formData.append("file", file);
 
-        playBtn.onclick = function() {
-            if (!uploaded) {
-                alert("请先上传一个视频文件！"); return;
-            }
-            
-            statusText.textContent = "正在播放...";
-            
-            // 设置视频和音频源
-            videoPlayer.src = "/video_stream";
-            audioPlayer.src = "/audio_stream";
-            audioPlayer.style.display="none";
-            
-            // 添加错误处理
-            videoPlayer.onerror = function(e) {
-                console.error("视频播放错误:", e);
-                statusText.textContent = "视频播放失败: " + e.message;
+                statusText.textContent = "上传中...";
+                playBtn.disabled = true;
+                fetch("/upload", {
+                    method: "POST",
+                    body: formData
+                }).then(resp => resp.json())
+                .then(data => {
+                    if (data.status === "ok") {
+                        uploaded = true;
+                        statusText.textContent = "上传并切分完成！";
+                        playBtn.disabled = false;
+                    } else {
+                        statusText.textContent = "上传失败";
+                    }
+                }).catch(e=>{
+                    statusText.textContent = "服务器出错: " + e;
+                });
             };
-            
-            audioPlayer.onerror = function(e) {
-                console.error("音频播放错误:", e);
-                statusText.textContent = "音频播放失败: " + e.message;
-            };
-            
-            // 同步播放逻辑
-            let syncAttempts = 0;
-            const maxSyncAttempts = 3;
-            
-            function attemptSyncPlay() {
-                syncAttempts++;
+
+            playBtn.onclick = function() {
+                if (!uploaded) {
+                    alert("请先上传一个视频文件！"); return;
+                }
                 
-                // 等待两个媒体都准备好
-                Promise.all([
-                    new Promise((resolve) => {
-                        if (videoPlayer.readyState >= 2) {
-                            resolve();
-                        } else {
-                            videoPlayer.addEventListener('canplay', resolve, { once: true });
-                        }
-                    }),
-                    new Promise((resolve) => {
-                        if (audioPlayer.readyState >= 2) {
-                            resolve();
-                        } else {
-                            audioPlayer.addEventListener('canplay', resolve, { once: true });
-                        }
-                    })
-                ]).then(() => {
-                    // 同时开始播放
-                    const playPromises = [
-                        videoPlayer.play(),
-                        audioPlayer.play()
-                    ];
+                statusText.textContent = "正在播放...";
+                
+                // 设置视频和音频源
+                videoPlayer.src = "/video_stream";
+                audioPlayer.src = "/audio_stream";
+                audioPlayer.style.display="none";
+                
+                // 添加错误处理
+                videoPlayer.onerror = function(e) {
+                    console.error("视频播放错误:", e);
+                    statusText.textContent = "视频播放失败: " + e.message;
+                };
+                
+                audioPlayer.onerror = function(e) {
+                    console.error("音频播放错误:", e);
+                    statusText.textContent = "音频播放失败: " + e.message;
+                };
+                
+                // 同步播放逻辑
+                let syncAttempts = 0;
+                const maxSyncAttempts = 3;
+                
+                function attemptSyncPlay() {
+                    syncAttempts++;
                     
-                    Promise.allSettled(playPromises).then((results) => {
-                        const videoResult = results[0];
-                        const audioResult = results[1];
-                        
-                        if (videoResult.status === 'fulfilled' && audioResult.status === 'fulfilled') {
-                            statusText.textContent = "播放中...";
-                            console.log("视频和音频同步播放成功");
-                        } else {
-                            console.error("播放失败:", videoResult, audioResult);
-                            if (syncAttempts < maxSyncAttempts) {
-                                console.log(`同步尝试 ${syncAttempts}/${maxSyncAttempts}，重试...`);
-                                setTimeout(attemptSyncPlay, 100);
+                    // 等待两个媒体都准备好
+                    Promise.all([
+                        new Promise((resolve) => {
+                            if (videoPlayer.readyState >= 2) {
+                                resolve();
                             } else {
-                                statusText.textContent = "播放失败，请重试";
+                                videoPlayer.addEventListener('canplay', resolve, { once: true });
                             }
+                        }),
+                        new Promise((resolve) => {
+                            if (audioPlayer.readyState >= 2) {
+                                resolve();
+                            } else {
+                                audioPlayer.addEventListener('canplay', resolve, { once: true });
+                            }
+                        })
+                    ]).then(() => {
+                        // 同时开始播放
+                        const playPromises = [
+                            videoPlayer.play(),
+                            audioPlayer.play()
+                        ];
+                        
+                        Promise.allSettled(playPromises).then((results) => {
+                            const videoResult = results[0];
+                            const audioResult = results[1];
+                            
+                            if (videoResult.status === 'fulfilled' && audioResult.status === 'fulfilled') {
+                                statusText.textContent = "播放中...";
+                                console.log("视频和音频同步播放成功");
+                            } else {
+                                console.error("播放失败:", videoResult, audioResult);
+                                if (syncAttempts < maxSyncAttempts) {
+                                    console.log(`同步尝试 ${syncAttempts}/${maxSyncAttempts}，重试...`);
+                                    setTimeout(attemptSyncPlay, 100);
+                                } else {
+                                    statusText.textContent = "播放失败，请重试";
+                                }
+                            }
+                        });
+                    }).catch((error) => {
+                        console.error("同步播放错误:", error);
+                        if (syncAttempts < maxSyncAttempts) {
+                            console.log(`同步尝试 ${syncAttempts}/${maxSyncAttempts}，重试...`);
+                            setTimeout(attemptSyncPlay, 100);
+                        } else {
+                            statusText.textContent = "播放失败，请重试";
                         }
                     });
-                }).catch((error) => {
-                    console.error("同步播放错误:", error);
-                    if (syncAttempts < maxSyncAttempts) {
-                        console.log(`同步尝试 ${syncAttempts}/${maxSyncAttempts}，重试...`);
-                        setTimeout(attemptSyncPlay, 100);
-                    } else {
-                        statusText.textContent = "播放失败，请重试";
-                    }
-                });
+                }
+                
+                // 开始同步播放
+                attemptSyncPlay();
+            };
+            
+            function checkDebug() {
+                fetch('/debug')
+                    .then(response => response.json())
+                    .then(data => {
+                        const debugInfo = document.getElementById('debugInfo');
+                        debugInfo.style.display = 'block';
+                        debugInfo.innerHTML = '<h3>调试信息:</h3><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                    })
+                    .catch(e => {
+                        const debugInfo = document.getElementById('debugInfo');
+                        debugInfo.style.display = 'block';
+                        debugInfo.innerHTML = '<h3>调试信息获取失败:</h3><pre>' + e + '</pre>';
+                    });
             }
             
-            // 开始同步播放
-            attemptSyncPlay();
-        };
-        
-        function checkDebug() {
-            fetch('/debug')
-                .then(response => response.json())
-                .then(data => {
-                    const debugInfo = document.getElementById('debugInfo');
-                    debugInfo.style.display = 'block';
-                    debugInfo.innerHTML = '<h3>调试信息:</h3><pre>' + JSON.stringify(data, null, 2) + '</pre>';
-                })
-                .catch(e => {
-                    const debugInfo = document.getElementById('debugInfo');
-                    debugInfo.style.display = 'block';
-                    debugInfo.innerHTML = '<h3>调试信息获取失败:</h3><pre>' + e + '</pre>';
-                });
-        }
-        
-        function createTestFrames() {
-            fetch('/test_frames')
-                .then(response => response.json())
-                .then(data => {
-                    statusText.textContent = `创建了 ${data.frames_count} 个测试帧`;
-                    playBtn.disabled = false;
-                    uploaded = true;
-                })
-                .catch(e => {
-                    statusText.textContent = "创建测试帧失败: " + e.message;
-                });
-        }
-    </script>
-</body>
-</html>
-"""
+            function createTestFrames() {
+                fetch('/test_frames')
+                    .then(response => response.json())
+                    .then(data => {
+                        statusText.textContent = `创建了 ${data.frames_count} 个测试帧`;
+                        playBtn.disabled = false;
+                        uploaded = true;
+                    })
+                    .catch(e => {
+                        statusText.textContent = "创建测试帧失败: " + e.message;
+                    });
+            }
+        </script>
+    </body>
+    </html>
+    """
 
 @app.route('/')
 def index():
