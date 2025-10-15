@@ -12,6 +12,7 @@ prompt:
 
 import os
 from flask import Flask, render_template_string, request, Response, send_file
+from werkzeug.utils import secure_filename
 from flask_socketio import SocketIO, emit
 import subprocess
 import threading
@@ -31,7 +32,6 @@ import glob
 import pickle
 import sys
 from tqdm import tqdm
-import copy
 import json
 import gc
 from transformers import WhisperModel
@@ -91,9 +91,7 @@ HTML = """
     <body>
         <h2>MuseTalk实时语音驱动 Demo</h2>
         <div>
-            <input type="file" id="fileInput" accept="audio/mp3,audio/wav,audio/mpeg">
-            <button id="uploadBtn">上传音频</button>
-            <button id="playBtn" disabled>开始推理</button>
+            <button id="playBtn">开始推理</button>
             <button id="stopBtn" disabled>停止</button>
         </div>
         <br><br>
@@ -101,19 +99,16 @@ HTML = """
             <canvas id="videoCanvas" width="512" height="512"></canvas>
             <audio id="audioPlayer" controls></audio>
         </div>
-        <p id="status">请上传音频文件</p>
+        <p id="status">准备就绪：使用默认音频 ./data/audio/dd.wav</p>
         <div id="debugInfo" style="display:none; background:#f0f0f0; padding:10px; margin:10px 0;"></div>
         <script>
-            let uploaded = false;
             let isPlaying = false;
             let playBtn = document.getElementById("playBtn");
-            let uploadBtn = document.getElementById("uploadBtn");
             let stopBtn = document.getElementById("stopBtn");
             let statusText = document.getElementById("status");
             let videoCanvas = document.getElementById("videoCanvas");
             let videoCtx = videoCanvas.getContext('2d', { alpha: false, desynchronized: true });
             let audioPlayer = document.getElementById("audioPlayer");
-            let fileInput = document.getElementById("fileInput");
             
             // 初始化Socket.IO连接
             const socket = io();
@@ -175,40 +170,7 @@ HTML = """
                 isPlaying = false;
             });
 
-            uploadBtn.onclick = function() {
-                let file = fileInput.files[0];
-                if (!file) {
-                    alert("请选择一个音频文件");
-                    return;
-                }
-                let formData = new FormData();
-                formData.append("file", file);
-
-                statusText.textContent = "上传中...";
-                playBtn.disabled = true;
-                fetch("/upload", {
-                    method: "POST",
-                    body: formData
-                }).then(resp => resp.json())
-                .then(data => {
-                    if (data.status === "ok") {
-                        uploaded = true;
-                        statusText.textContent = "上传完成！可以开始推理";
-                        playBtn.disabled = false;
-                    } else {
-                        statusText.textContent = "上传失败: " + data.error;
-                    }
-                }).catch(e=>{
-                    statusText.textContent = "服务器出错: " + e;
-                });
-            };
-
             playBtn.onclick = function() {
-                if (!uploaded) {
-                    alert("请先上传一个音频文件！"); 
-                    return;
-                }
-                
                 // 发送开始推理请求
                 socket.emit('start_inference');
             };
@@ -231,14 +193,14 @@ class WebAvatar:
         self.image_path = image_path
         self.bbox_shift = bbox_shift
         self.batch_size = batch_size
-        self.base_path = f"./results/web_avatars/{avatar_id}"
-        self.avatar_path = self.base_path
-        self.full_imgs_path = f"{self.avatar_path}/full_imgs"
-        self.coords_path = f"{self.avatar_path}/coords.pkl"
-        self.latents_out_path = f"{self.avatar_path}/latents.pt"
-        self.mask_out_path = f"{self.avatar_path}/mask"
-        self.mask_coords_path = f"{self.avatar_path}/mask_coords.pkl"
-        self.avatar_info_path = f"{self.avatar_path}/avator_info.json"
+        
+        # 内存存储，不使用磁盘路径
+        self.base_bbox = None
+        self.base_mask = None
+        self.base_mask_crop_box = None
+        self.input_latent = None
+        self.input_latent_list_cycle = None
+        self.base_frame = None
         
         self.avatar_info = {
             "avatar_id": avatar_id,
@@ -250,34 +212,14 @@ class WebAvatar:
         self.init()
 
     def init(self):
-        """初始化Avatar"""
-        if os.path.exists(self.avatar_path):
-            # 加载已存在的数据
-            self.input_latent = torch.load(self.latents_out_path)
-            with open(self.coords_path, 'rb') as f:
-                self.base_bbox = pickle.load(f)
-            input_img_list = glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]'))
-            input_img_list = sorted(input_img_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-            self.base_frame = read_imgs([input_img_list[0]])[0]
-            with open(self.mask_coords_path, 'rb') as f:
-                self.base_mask_crop_box = pickle.load(f)
-            input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
-            input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-            self.base_mask = read_imgs([input_mask_list[0]])[0]
-            self.input_latent_list_cycle = [self.input_latent]
-        else:
-            # 创建新Avatar
-            os.makedirs(self.avatar_path, exist_ok=True)
-            os.makedirs(self.full_imgs_path, exist_ok=True)
-            os.makedirs(self.mask_out_path, exist_ok=True)
-            self.prepare_material()
+        """初始化Avatar - 完全基于内存操作"""
+        # 直接从图片路径加载并处理，不保存到磁盘
+        self.process_image_from_path()
 
-    def prepare_material(self):
-        """准备Avatar材料"""
-        print("preparing data materials ... ...")
-        with open(self.avatar_info_path, "w") as f:
-            json.dump(self.avatar_info, f)
-
+    def process_image_from_path(self):
+        """直接从图片路径处理，所有操作在内存中完成"""
+        print("Processing image in memory...")
+        
         if not os.path.isfile(self.image_path):
             print(f"Error: Input must be an image file: {self.image_path}")
             return False
@@ -288,13 +230,9 @@ class WebAvatar:
         if ext not in image_exts:
             print(f"Error: Unsupported file extension: {ext}")
             return False
-            
-        # 复制图片作为首帧
-        print(f"copy image {self.image_path} as base frame")
-        base_dst = f"{self.full_imgs_path}/00000000{ext}"
-        shutil.copyfile(self.image_path, base_dst)
-        input_img_list = [base_dst]
 
+        # 直接读取图片到内存，不复制到磁盘
+        input_img_list = [self.image_path]
         print("extracting landmarks...")
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
         bbox = coord_list[0]
@@ -321,15 +259,8 @@ class WebAvatar:
         self.base_mask_crop_box = crop_box
         self.input_latent = latents
         self.input_latent_list_cycle = [self.input_latent]
-
-        # 保存到磁盘
-        with open(self.coords_path, 'wb') as f:
-            pickle.dump(self.base_bbox, f)
-        with open(self.mask_coords_path, 'wb') as f:
-            pickle.dump(self.base_mask_crop_box, f)
-        cv2.imwrite(f"{self.mask_out_path}/00000000.png", self.base_mask)
-        cv2.imwrite(f"{self.full_imgs_path}/00000000.png", self.base_frame)
-        torch.save(self.input_latent, self.latents_out_path)
+        
+        print("Image processed successfully in memory")
         return True
 
     def inference_stream_web(self, audio_path, fps=25):
@@ -343,7 +274,7 @@ class WebAvatar:
                 chunk_start = time.time()
                 
                 # 清理内存
-                clear_cuda_cache()
+                # clear_cuda_cache()
                 
                 stream_features, stream_length = audio_processor.get_audio_stream_feature(chunk, weight_dtype=weight_dtype)
                 whisper_chunks = audio_processor.get_whisper_chunk(
@@ -359,6 +290,8 @@ class WebAvatar:
 
                 gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
                 for _, (whisper_batch, latent_batch) in enumerate(gen):
+                    pic_infer_start = time.time()
+
                     # 编码音频特征并推理
                     audio_feature_batch = pe(whisper_batch.to(device))
                     latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)
@@ -368,8 +301,11 @@ class WebAvatar:
                         pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
                         pred_latents = pred_latents.to(device=device, dtype=vae.vae.dtype)
                         recon = vae.decode_latents(pred_latents)
+
+                    print(f"pic_infer_time: {(time.time() - pic_infer_start) * 1000:.1f}ms")
                     
                     # 简单的帧率限制：仅保留每秒fps帧
+                    send_start = time.time()
                     frame_interval = max(1, int(len(recon) / max(1, fps)))
                     for i, res_frame in enumerate(recon):
                         if i % frame_interval != 0:
@@ -378,12 +314,11 @@ class WebAvatar:
                         self.process_and_send_frame(res_frame)
                         
                         # 发送对应的音频块
+                        print("send audio chunk to frontend:")
                         audio_chunk_bytes = chunk.tobytes()
                         socketio.emit('audio_chunk', {'audio': audio_chunk_bytes})
-                    
-                    # 清理中间变量
-                    del audio_feature_batch, latent_batch, pred_latents, recon
-                    clear_cuda_cache()
+                    print(f"send current chunk done. send_time: {(time.time() - send_start) * 1000:.1f}ms ")
+         
 
                 print(f"processed 1s audio chunk in {(time.time() - chunk_start) * 1000:.1f}ms")
                 print(f"Memory status: {get_gpu_memory_info()}")
@@ -403,7 +338,7 @@ class WebAvatar:
         """处理帧并发送到前端"""
         try:
             bbox = self.base_bbox
-            ori_frame = copy.deepcopy(self.base_frame)
+            ori_frame = self.base_frame  # no deepcopy needed; blending does not mutate input
             x1, y1, x2, y2 = bbox
             res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
             mask = self.base_mask
@@ -440,13 +375,11 @@ def handle_start_inference():
         emit('inference_error', {'error': 'No avatar available'})
         return
     
-    # 检查是否有上传的音频文件
-    audio_files = [f for f in os.listdir(temp_dir) if f.endswith(('.mp3', '.wav', '.mpeg'))]
-    if not audio_files:
-        emit('inference_error', {'error': 'No audio file uploaded'})
+    # 使用固定音频路径
+    audio_path = os.path.abspath(os.path.join('.', 'data', 'audio', 'dd.wav'))
+    if not os.path.exists(audio_path):
+        emit('inference_error', {'error': f'Default audio not found: {audio_path}'})
         return
-    
-    audio_path = os.path.join(temp_dir, audio_files[0])
     is_inferring = True
     
     # 启动推理线程
@@ -492,13 +425,20 @@ def upload_file():
     if not f.filename.lower().endswith(('.mp3', '.wav', '.mpeg')):
         return {"status": "error", "error": "Unsupported file type. Please upload MP3 or WAV files."}
     
-    # 保存文件
-    filename = f.filename
+    # 将文件保存到临时目录，供推理线程读取
+    filename = secure_filename(f.filename)
+    # 清理旧的音频文件，避免混淆
+    for old in os.listdir(temp_dir):
+        if old.lower().endswith((".mp3", ".wav", ".mpeg")):
+            try:
+                os.remove(os.path.join(temp_dir, old))
+            except Exception:
+                pass
     save_path = os.path.join(temp_dir, filename)
     f.save(save_path)
-    
-    print(f"Audio file uploaded: {save_path}")
-    return {"status": "ok", "message": "File uploaded successfully"}
+    file_size = os.path.getsize(save_path) if os.path.exists(save_path) else 0
+    print(f"Audio file saved: {filename} -> {save_path} ({file_size} bytes)")
+    return {"status": "ok", "message": "File uploaded successfully", "filename": filename, "size": file_size}
 
 
 
