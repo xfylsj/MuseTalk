@@ -1,6 +1,5 @@
 
 
-
 """
 prompt:
 创建一个html客户端页面，主要功能如下：
@@ -109,6 +108,21 @@ HTML = """
             let videoCanvas = document.getElementById("videoCanvas");
             let videoCtx = videoCanvas.getContext('2d', { alpha: false, desynchronized: true });
             let audioPlayer = document.getElementById("audioPlayer");
+            let audioCtx = null;
+            let audioQueue = [];
+            let nextStartTime = 0;
+            function ensureAudioContext() {
+                if (!audioCtx) {
+                    try {
+                        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    } catch (e) {
+                        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                }
+                if (audioCtx.state === 'suspended') {
+                    audioCtx.resume();
+                }
+            }
             
             // 初始化Socket.IO连接
             const socket = io();
@@ -139,13 +153,34 @@ HTML = """
                 }
             });
             
-            socket.on('audio_chunk', function(data) {
-                if (isPlaying) {
-                    // 播放音频块
-                    const audioBlob = new Blob([data.audio], {type: 'audio/wav'});
-                    const audioUrl = URL.createObjectURL(audioBlob);
-                    audioPlayer.src = audioUrl;
-                    audioPlayer.play();
+            socket.on('audio_chunk', async function(payload) {
+                if (!isPlaying) return;
+                try {
+                    let arrayBuffer = null;
+                    if (payload instanceof ArrayBuffer) {
+                        arrayBuffer = payload;
+                    } else if (payload instanceof Blob) {
+                        arrayBuffer = await payload.arrayBuffer();
+                    } else if (payload && payload.data) {
+                        if (payload.data instanceof ArrayBuffer) arrayBuffer = payload.data;
+                        else if (payload.data instanceof Blob) arrayBuffer = await payload.data.arrayBuffer();
+                    }
+                    if (!arrayBuffer) return;
+                    ensureAudioContext();
+                    const wavBlob = new Blob([arrayBuffer], { type: 'audio/wav' });
+                    const wavBuf = await wavBlob.arrayBuffer();
+                    audioCtx.decodeAudioData(wavBuf.slice(0), (decoded) => {
+                        const src = audioCtx.createBufferSource();
+                        src.buffer = decoded;
+                        src.connect(audioCtx.destination);
+                        const startAt = Math.max(audioCtx.currentTime + 0.05, nextStartTime || audioCtx.currentTime + 0.05);
+                        try { src.start(startAt); } catch (_) { src.start(); }
+                        nextStartTime = startAt + decoded.duration;
+                    }, (err) => {
+                        // ignore decode errors for individual chunks
+                    });
+                } catch (e) {
+                    // ignore
                 }
             });
             
@@ -172,6 +207,7 @@ HTML = """
 
             playBtn.onclick = function() {
                 // 发送开始推理请求
+                ensureAudioContext();
                 socket.emit('start_inference');
             };
             
@@ -179,6 +215,11 @@ HTML = """
                 // 发送停止推理请求
                 socket.emit('stop_inference');
                 statusText.textContent = "正在停止...";
+                if (audioCtx && audioCtx.state !== 'closed') {
+                    try { audioCtx.close(); } catch (e) {}
+                }
+                audioCtx = null;
+                nextStartTime = 0;
             };
         </script>
     </body>
@@ -263,7 +304,7 @@ class WebAvatar:
         print("Image processed successfully in memory")
         return True
 
-    def inference_stream_web(self, audio_path, fps=25):
+    def inference_stream_web_origin(self, audio_path, fps=25):
         """Web版本的流式推理"""
         print("start web inference")
         self.idx = 0
@@ -315,8 +356,19 @@ class WebAvatar:
                         
                         # 发送对应的音频块
                         print("send audio chunk to frontend:")
-                        audio_chunk_bytes = chunk.tobytes()
-                        socketio.emit('audio_chunk', {'audio': audio_chunk_bytes})
+                        # 将 float32 PCM [-1,1] 转为 16-bit PCM 并封装 WAV 头
+                        try:
+                            pcm16 = (np.clip(chunk, -1.0, 1.0) * 32767.0).astype(np.int16)
+                            wav_buffer = io.BytesIO()
+                            with wave.open(wav_buffer, 'wb') as wf:
+                                wf.setnchannels(1)
+                                wf.setsampwidth(2)  # 16-bit
+                                wf.setframerate(16000)
+                                wf.writeframes(pcm16.tobytes())
+                            audio_chunk_bytes = wav_buffer.getvalue()
+                            socketio.emit('audio_chunk', {'audio': audio_chunk_bytes})
+                        except Exception as _e:
+                            print(f"audio chunk encode error: {_e}")
                     print(f"send current chunk done. send_time: {(time.time() - send_start) * 1000:.1f}ms ")
          
 
@@ -333,6 +385,139 @@ class WebAvatar:
             return
             
         socketio.emit('inference_complete', {'message': 'Inference completed'})
+
+    def inference_stream_web(self, audio_path, fps=25):
+        """Web版本的流式推理（队列化，去除多层for嵌套）"""
+        print("start web inference")
+        self.idx = 0
+
+        # 队列：音频块 -> whisper块 -> 模型重建帧
+        audio_q: queue.Queue = queue.Queue(maxsize=8)
+        whisper_q: queue.Queue = queue.Queue(maxsize=16)
+        frames_q: queue.Queue = queue.Queue(maxsize=16)
+
+        stop_flag = threading.Event()
+
+        def producer_audio():
+            try:
+                for chunk in audio_processor.create_audio_stream_from_file(audio_path, chunk_size=4000):
+                    if stop_flag.is_set() or not is_inferring:
+                        break
+                    audio_q.put(chunk)
+            finally:
+                # 结束标记
+                audio_q.put(None)
+
+        def stage_whisper():
+            while True:
+                if stop_flag.is_set() or not is_inferring:
+                    break
+                chunk = audio_q.get()
+                if chunk is None:
+                    # 传递结束标记
+                    whisper_q.put((None, None))
+                    break
+                stream_features, stream_length = audio_processor.get_audio_stream_feature(chunk, weight_dtype=weight_dtype)
+                whisper_chunks = audio_processor.get_whisper_chunk(
+                    stream_features,
+                    device,
+                    weight_dtype,
+                    whisper,
+                    stream_length,
+                    fps=fps,
+                    audio_padding_length_left=2,
+                    audio_padding_length_right=2,
+                )
+                # 增量产出：在本阶段就按 batch 切分并入队，降低下游等待时间
+                gen_local = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
+                for _, (whisper_batch, _) in enumerate(gen_local):
+                    if stop_flag.is_set() or not is_inferring:
+                        break
+                    whisper_q.put((whisper_batch, chunk))
+
+        def stage_infer_and_decode():
+            while True:
+                if stop_flag.is_set() or not is_inferring:
+                    break
+                whisper_item, raw_chunk = whisper_q.get()
+                if whisper_item is None:
+                    # 结束标记
+                    frames_q.put((None, None))
+                    break
+
+                # 直接消费单个 whisper 批并推理（latent 批来自循环单帧 latent 列表）
+                # 这里每个批的 latent_batch 与 whisper_batch 数量一致，由 datagen 的逻辑保证
+                # 重新生成一次对应大小的 latent 批
+                gen_latent = datagen(whisper_item, self.input_latent_list_cycle, self.batch_size)
+                for _, (whisper_batch, latent_batch) in enumerate(gen_latent):
+                    if stop_flag.is_set() or not is_inferring:
+                        break
+                    pic_infer_start = time.time()
+                    audio_feature_batch = pe(whisper_batch.to(device))
+                    latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)
+                    with torch.no_grad():
+                        pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+                        pred_latents = pred_latents.to(device=device, dtype=vae.vae.dtype)
+                        recon = vae.decode_latents(pred_latents)
+                    frames_q.put((recon, raw_chunk))
+                    print(f"pic_infer_time: {(time.time() - pic_infer_start) * 1000:.1f}ms")
+
+        def consumer_emit():
+            try:
+                while True:
+                    if stop_flag.is_set() or not is_inferring:
+                        break
+                    recon, raw_chunk = frames_q.get()
+                    if recon is None:
+                        break
+                    # 帧率限制
+                    frame_interval = max(1, int(len(recon) / max(1, fps)))
+                    send_start = time.time()
+                    for i, res_frame in enumerate(recon):
+                        if i % frame_interval != 0:
+                            continue
+                        self.process_and_send_frame(res_frame)
+                    # 发送对应的音频块（与该批次视频对应）
+                    if raw_chunk is not None:
+                        try:
+                            pcm16 = (np.clip(raw_chunk, -1.0, 1.0) * 32767.0).astype(np.int16)
+                            wav_buffer = io.BytesIO()
+                            with wave.open(wav_buffer, 'wb') as wf:
+                                wf.setnchannels(1)
+                                wf.setsampwidth(2)
+                                wf.setframerate(16000)
+                                wf.writeframes(pcm16.tobytes())
+                            audio_chunk_bytes = wav_buffer.getvalue()
+                            # 直接以二进制发送，避免JSON封装影响
+                            socketio.emit('audio_chunk', audio_chunk_bytes)
+                        except Exception as _e:
+                            print(f"audio chunk encode error: {_e}")
+                    print(f"send current batch done. send_time: {(time.time() - send_start) * 1000:.1f}ms ")
+            finally:
+                pass
+
+        # 启动各阶段线程
+        t_prod = threading.Thread(target=producer_audio, daemon=True)
+        t_wsp = threading.Thread(target=stage_whisper, daemon=True)
+        t_infer = threading.Thread(target=stage_infer_and_decode, daemon=True)
+        t_emit = threading.Thread(target=consumer_emit, daemon=True)
+
+        try:
+            t_prod.start(); t_wsp.start(); t_infer.start(); t_emit.start()
+            # 等待管线完成或被外部停止
+            while any(t.is_alive() for t in (t_prod, t_wsp, t_infer)) and is_inferring:
+                time.sleep(0.01)
+            # 通知消费端结束
+            frames_q.put((None, None))
+        except Exception as e:
+            print(f"Inference error: {e}")
+            socketio.emit('inference_error', {'error': str(e)})
+            return
+        finally:
+            stop_flag.set()
+
+        socketio.emit('inference_complete', {'message': 'Inference completed'})
+
 
     def process_and_send_frame(self, res_frame):
         """处理帧并发送到前端"""
@@ -561,3 +746,4 @@ if __name__ == '__main__':
 cmd:
     python -m scripts.realtime_web_stream
 """
+
